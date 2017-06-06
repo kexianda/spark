@@ -26,8 +26,9 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.{expressions, InternalRow}
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
-import org.apache.spark.sql.types.{StringType, StructType}
+import org.apache.spark.sql.types.{DataType, StringType, StructType}
 
 /**
  * An abstract class that represents [[FileIndex]]s that are aware of partitioned tables.
@@ -59,7 +60,9 @@ abstract class PartitioningAwareFileIndex(
   override def listFiles(
       partitionFilters: Seq[Expression], dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
     val selectedPartitions = if (partitionSpec().partitionColumns.isEmpty) {
-      PartitionDirectory(InternalRow.empty, allFiles().filter(f => isDataPath(f.getPath))) :: Nil
+      PartitionDirectory(InternalRow.empty,
+        allFiles().filter(f => isDataPath(f.getPath))
+          .filter(f => !mockPrunedByBFIndex(f.getPath, dataFilters))) :: Nil
     } else {
       prunePartitions(partitionFilters, partitionSpec()).map {
         case PartitionPath(values, path) =>
@@ -67,6 +70,7 @@ abstract class PartitioningAwareFileIndex(
             case Some(existingDir) =>
               // Directory has children files in it, return them
               existingDir.filter(f => isDataPath(f.getPath))
+                .filter(f => !mockPrunedByBFIndex(f.getPath, dataFilters))
 
             case None =>
               // Directory does not exist, or has no children files
@@ -191,6 +195,40 @@ abstract class PartitioningAwareFileIndex(
     } else {
       partitions
     }
+  }
+
+  private def mockPrunedByBFIndex(path: Path, predicates: Seq[Expression]): Boolean = {
+    if (predicates.size <= 0) {
+      false
+    } else {
+      try {
+        val filter = predicates.reduce(expressions.And)
+        val afterBF = filter transform {
+          case e@EqualTo(left@AttributeReference(name, _, _, _), right@Literal(value, dataType)) =>
+            if (!mockBloomFilterHit(name, value, dataType, path)) {
+              TrueLiteral
+            } else {
+              FalseLiteral
+            }
+          /* case _ :BinaryComparison => EqualTo(TrueLiteral, FalseLiteral) */
+          case _ : BinaryComparison => FalseLiteral
+        }
+        !afterBF.eval().asInstanceOf[Boolean]
+      } catch {
+        case e: Exception => false
+      }
+    }
+  }
+
+
+  /**
+   * mockup CachedIndexService
+   * if name is indexed, bloomfilter return true
+   * use partitoin path to simulate Bloom filter
+   */
+  private def mockBloomFilterHit(name: String, value: Any, dataType: DataType,
+                                 path: Path): Boolean = {
+    path.toUri().getPath().contains(value.toString())
   }
 
   /**
